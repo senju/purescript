@@ -39,7 +39,6 @@ module Language.PureScript.Make
 #if __GLASGOW_HASKELL__ < 710
 import Control.Applicative
 #endif
-import Control.Arrow ((&&&))
 import Control.Monad
 import Control.Monad.Error.Class (MonadError(..))
 import Control.Monad.Trans.Except
@@ -47,9 +46,7 @@ import Control.Monad.Reader
 import Control.Monad.Writer.Strict
 import Control.Monad.Supply
 
-import Data.Function (on)
-import Data.Either (partitionEithers)
-import Data.List (sortBy, groupBy, foldl')
+import Data.List (foldl')
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock
 import Data.String (fromString)
@@ -61,7 +58,6 @@ import Data.Version (showVersion)
 import Data.Aeson (encode, decode)
 import qualified Data.ByteString.Lazy as B
 import qualified Data.Map as M
-import qualified Data.Set as S
 
 import System.Directory
        (doesFileExist, getModificationTime, createDirectoryIfMissing)
@@ -153,62 +149,58 @@ data RebuildPolicy
 make :: forall m. (Functor m, Applicative m, Monad m, MonadReader Options m, MonadError MultipleErrors m, MonadWriter MultipleErrors m)
      => MakeActions m
      -> [Module]
-     -> m Environment
+     -> m ()
 make MakeActions{..} ms = do
-  (sorted, graph) <- sortModules $ map importPrim ms
-  toRebuild <- foldM (\s (Module _ _ moduleName' _ _) -> do
-    inputTimestamp <- getInputTimestamp moduleName'
-    outputTimestamp <- getOutputTimestamp moduleName'
-    return $ case (inputTimestamp, outputTimestamp) of
-      (Right (Just t1), Just t2) | t1 < t2 -> s
-      (Left RebuildNever, Just _) -> s
-      _ -> S.insert moduleName' s) S.empty sorted
+  (sorted, graph) <- sortModules ms
+  for_ sorted $ \m -> do
+    let deps = fromMaybe (error "make: module not found in dependency graph.") $ lookup (getModuleName m) graph
+    buildModule (importPrim m) deps
 
-  (externs, toBuild) <- partitionEithers <$> rebuildIfNecessary (reverseDependencies graph) toRebuild sorted
-  for_ toBuild lint
-  (desugared, nextVar) <- runSupplyT 0 $ desugar externs toBuild
-  let env = foldl' (flip applyExternsFileToEnvironment) initEnvironment externs
-  evalSupplyT nextVar $ go env desugared
   where
+  buildModule :: Module -> [ModuleName] -> m ()
+  buildModule m@(Module _ _ moduleName _ _) deps = do
+    outputTimestamp <- getOutputTimestamp moduleName
+    dependencyTimestamp <- maximumMaybe <$> mapM (fmap shouldExist . getOutputTimestamp) deps
+    inputTimestamp <- getInputTimestamp moduleName
 
-  go :: Environment -> [Module] -> SupplyT m Environment
-  go env [] = return env
-  go env (m@(Module ss coms moduleName' _ exps) : ms') = do
-    lift . progress $ CompilingModule moduleName'
-    (checked@(Module _ _ _ elaborated _), env') <- lift . runCheck' env $ typeCheckModule Nothing m
-    checkExhaustiveModule env' checked
-    regrouped <- createBindingGroups moduleName' . collapseBindingGroups $ elaborated
-    let mod' = Module ss coms moduleName' regrouped exps
-        corefn = CF.moduleToCoreFn env' mod'
-        [renamed] = renameInModules [corefn]
-        exts = encode $ moduleToExternsFile mod' env'
-    codegen renamed env' exts
-    go env' ms'
+    let shouldRebuild = case (inputTimestamp, dependencyTimestamp, outputTimestamp) of
+                          (Right (Just t1), Just t3, Just t2) -> t1 > t2 || t3 > t2
+                          (Right (Just t1), Nothing, Just t2) -> t1 > t2
+                          (Left RebuildNever, _, Just _) -> False
+                          _ -> True
 
-  rebuildIfNecessary :: M.Map ModuleName [ModuleName] -> S.Set ModuleName -> [Module] -> m [Either ExternsFile Module]
-  rebuildIfNecessary graph = rebuildIfNecessary'
-    where
-    rebuildIfNecessary' :: S.Set ModuleName -> [Module] -> m [Either ExternsFile Module]
-    rebuildIfNecessary' _ [] = return []
-    rebuildIfNecessary' toRebuild (m@(Module _ _ moduleName' _ _) : ms')
-      | moduleName' `S.member` toRebuild = rebuild toRebuild m moduleName' ms'
-    rebuildIfNecessary' toRebuild (m@(Module _ _ moduleName' _ _) : ms') = do
-      (_, externsJson) <- readExterns moduleName'
-      case decode externsJson of
-        Just externs
-          | efVersion externs == showVersion Paths.version -> (Left externs :) <$> rebuildIfNecessary' toRebuild ms'
-        _ -> rebuild toRebuild m moduleName' ms'
+    when shouldRebuild $ do
+      progress $ CompilingModule moduleName
+      mExterns <- sequence <$> mapM (fmap (decodeExterns . snd) . readExterns) deps
+      case mExterns of
+        Nothing -> error "make: externs files are out of date. Try 'rm output/*/externs.json'."
+        Just externs -> do
+          let env = foldl' (flip applyExternsFileToEnvironment) initEnvironment externs
+          lint m
+          ([desugared], nextVar) <- runSupplyT 0 $ desugar externs [m]
+          (checked@(Module ss coms _ elaborated exps), env') <- runCheck' env $ typeCheckModule Nothing desugared
+          checkExhaustiveModule env' checked
+          regrouped <- createBindingGroups moduleName . collapseBindingGroups $ elaborated
+          let mod' = Module ss coms moduleName regrouped exps
+              corefn = CF.moduleToCoreFn env' mod'
+              [renamed] = renameInModules [corefn]
+              exts = encode $ moduleToExternsFile mod' env'
+          evalSupplyT nextVar $ codegen renamed env' exts
 
-    rebuild :: S.Set ModuleName -> Module -> ModuleName -> [Module] -> m [Either ExternsFile Module]
-    rebuild toRebuild m moduleName ms' = do
-      let deps = fromMaybe [] $ moduleName `M.lookup` graph
-      (Right m :) <$> rebuildIfNecessary' (toRebuild `S.union` S.fromList deps) ms'
+  maximumMaybe :: (Ord a) => [a] -> Maybe a
+  maximumMaybe [] = Nothing
+  maximumMaybe xs = Just $ maximum xs
 
-reverseDependencies :: ModuleGraph -> M.Map ModuleName [ModuleName]
-reverseDependencies g = combine [ (dep, mn) | (mn, deps) <- g, dep <- deps ]
-  where
-  combine :: (Ord a) => [(a, b)] -> M.Map a [b]
-  combine = M.fromList . map ((fst . head) &&& map snd) . groupBy ((==) `on` fst) . sortBy (compare `on` fst)
+  -- Make sure a dependency exists
+  shouldExist :: Maybe UTCTime -> UTCTime
+  shouldExist (Just t) = t
+  shouldExist _ = error "make: dependency should already have been built."
+
+  decodeExterns :: B.ByteString -> Maybe ExternsFile
+  decodeExterns bs = do
+    externs <- decode bs
+    guard $ efVersion externs == showVersion Paths.version
+    return externs
 
 -- |
 -- Add an import declaration for a module if it does not already explicitly import it.
