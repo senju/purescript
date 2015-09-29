@@ -19,6 +19,8 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE CPP #-}
 
 module Language.PureScript.Make
@@ -45,6 +47,10 @@ import Control.Monad.Trans.Except
 import Control.Monad.Reader
 import Control.Monad.Writer.Strict
 import Control.Monad.Supply
+import Control.Monad.Base (MonadBase(..))
+import Control.Monad.Trans.Control (MonadBaseControl(..))
+
+import Control.Concurrent.Lifted as C
 
 import Data.List (foldl')
 import Data.Maybe (fromMaybe)
@@ -147,29 +153,35 @@ data RebuildPolicy
 -- If timestamps have not changed, the externs file can be used to provide the module's types without
 -- having to typecheck the module again.
 --
-make :: forall m. (Functor m, Applicative m, Monad m, MonadReader Options m, MonadError MultipleErrors m, MonadWriter MultipleErrors m)
+make :: forall m. (Functor m, Applicative m, Monad m, MonadBaseControl IO m, MonadReader Options m, MonadError MultipleErrors m, MonadWriter MultipleErrors m)
      => MakeActions m
      -> [Module]
      -> m ()
 make MakeActions{..} ms = do
   (sorted, graph) <- sortModules ms
+
+  barriers <- zip (map getModuleName sorted) <$> replicateM (length ms) C.newEmptyMVar
+
   -- We need to load all dependencies, including transitive dependencies, since type
   -- class instances are propagated by import statements.
   let tClosure =
         [ (mn, inOrderOf (deps ++ concatMap (fromMaybe [] . flip lookup tClosure) deps) (map getModuleName sorted))
         | (mn, deps) <- graph
         ]
-  for_ sorted $ \m -> do
+  for_ sorted $ \m -> fork $ do
     let deps = fromMaybe (error "make: module not found in dependency graph.") $ lookup (getModuleName m) tClosure
-    buildModule (importPrim m) deps
+    buildModule barriers (importPrim m) deps
+
+  -- TODO: wait for all threads to finish
+  C.threadDelay 1000000
 
   where
   -- Sort a list so its elements appear in the same order as in another list.
   inOrderOf :: (Ord a) => [a] -> [a] -> [a]
   inOrderOf xs ys = let s = S.fromList xs in filter (`S.member` s) ys
 
-  buildModule :: Module -> [ModuleName] -> m ()
-  buildModule m@(Module _ _ moduleName _ _) deps = do
+  buildModule :: [(ModuleName, C.MVar ExternsFile)] -> Module -> [ModuleName] -> m ()
+  buildModule barriers m@(Module _ _ moduleName _ _) deps = do
     outputTimestamp <- getOutputTimestamp moduleName
     dependencyTimestamp <- maximumMaybe <$> mapM (fmap shouldExist . getOutputTimestamp) deps
     inputTimestamp <- getInputTimestamp moduleName
@@ -180,23 +192,27 @@ make MakeActions{..} ms = do
                           (Left RebuildNever, _, Just _) -> False
                           _ -> True
 
-    when shouldRebuild $ do
-      progress $ CompilingModule moduleName
-      mExterns <- sequence <$> mapM (fmap (decodeExterns . snd) . readExterns) deps
-      case mExterns of
-        Nothing -> error "make: externs files are out of date. Try 'rm output/*/externs.json'."
-        Just externs -> do
-          let env = foldl' (flip applyExternsFileToEnvironment) initEnvironment externs
-          lint m
-          ([desugared], nextVar) <- runSupplyT 0 $ desugar externs [m]
-          (checked@(Module ss coms _ elaborated exps), env') <- runCheck' env $ typeCheckModule Nothing desugared
-          checkExhaustiveModule env' checked
-          regrouped <- createBindingGroups moduleName . collapseBindingGroups $ elaborated
-          let mod' = Module ss coms moduleName regrouped exps
-              corefn = CF.moduleToCoreFn env' mod'
-              [renamed] = renameInModules [corefn]
-              exts = encode $ moduleToExternsFile mod' env'
-          evalSupplyT nextVar $ codegen renamed env' exts
+    exts <- if shouldRebuild
+              then do
+                progress $ CompilingModule moduleName
+                externs <- mapM (readMVar . fromMaybe (error "make: no barrier") . flip lookup barriers) deps
+                let env = foldl' (flip applyExternsFileToEnvironment) initEnvironment externs
+                lint m
+                ([desugared], nextVar) <- runSupplyT 0 $ desugar externs [m]
+                (checked@(Module ss coms _ elaborated exps), env') <- runCheck' env $ typeCheckModule Nothing desugared
+                checkExhaustiveModule env' checked
+                regrouped <- createBindingGroups moduleName . collapseBindingGroups $ elaborated
+                let mod' = Module ss coms moduleName regrouped exps
+                    corefn = CF.moduleToCoreFn env' mod'
+                    [renamed] = renameInModules [corefn]
+                    exts = moduleToExternsFile mod' env'
+                evalSupplyT nextVar $ codegen renamed env' $ encode exts
+                return exts
+              else do
+                mexts <- decodeExterns . snd <$> readExterns moduleName
+                return $ fromMaybe (error "make: externs files are out of date. Try 'rm output/*/externs.json'.") mexts
+
+    putMVar (fromMaybe (error "make: no barrier") $ lookup moduleName barriers) exts
 
   maximumMaybe :: (Ord a) => [a] -> Maybe a
   maximumMaybe [] = Nothing
@@ -233,6 +249,14 @@ importPrim = addDefaultImport (ModuleName [ProperName C.prim])
 --
 newtype Make a = Make { unMake :: ReaderT Options (WriterT MultipleErrors (ExceptT MultipleErrors IO)) a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadError MultipleErrors, MonadWriter MultipleErrors, MonadReader Options)
+
+instance MonadBase IO Make where
+  liftBase = liftIO
+
+instance MonadBaseControl IO Make where
+  type StM Make a = Either MultipleErrors (a, MultipleErrors)
+  liftBaseWith f = Make $ liftBaseWith $ \q -> f (q . unMake)
+  restoreM = Make . restoreM
 
 -- |
 -- Execute a 'Make' monad, returning either errors, or the result of the compile plus any warnings.
