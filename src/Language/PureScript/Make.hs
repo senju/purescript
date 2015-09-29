@@ -57,6 +57,7 @@ import Data.Traversable (traverse)
 import Data.Version (showVersion)
 import Data.Aeson (encode, decode)
 import qualified Data.ByteString.Lazy as B
+import qualified Data.Set as S
 import qualified Data.Map as M
 
 import System.Directory
@@ -152,11 +153,21 @@ make :: forall m. (Functor m, Applicative m, Monad m, MonadReader Options m, Mon
      -> m ()
 make MakeActions{..} ms = do
   (sorted, graph) <- sortModules ms
+  -- We need to load all dependencies, including transitive dependencies, since type
+  -- class instances are propagated by import statements.
+  let tClosure =
+        [ (mn, inOrderOf (deps ++ concatMap (fromMaybe [] . flip lookup tClosure) deps) (map getModuleName sorted))
+        | (mn, deps) <- graph
+        ]
   for_ sorted $ \m -> do
-    let deps = fromMaybe (error "make: module not found in dependency graph.") $ lookup (getModuleName m) graph
+    let deps = fromMaybe (error "make: module not found in dependency graph.") $ lookup (getModuleName m) tClosure
     buildModule (importPrim m) deps
 
   where
+  -- Sort a list so its elements appear in the same order as in another list.
+  inOrderOf :: (Ord a) => [a] -> [a] -> [a]
+  inOrderOf xs ys = let s = S.fromList xs in filter (`S.member` s) ys
+
   buildModule :: Module -> [ModuleName] -> m ()
   buildModule m@(Module _ _ moduleName _ _) deps = do
     outputTimestamp <- getOutputTimestamp moduleName
