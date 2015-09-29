@@ -160,7 +160,7 @@ make :: forall m. (Functor m, Applicative m, Monad m, MonadBaseControl IO m, Mon
 make MakeActions{..} ms = do
   (sorted, graph) <- sortModules ms
 
-  barriers <- zip (map getModuleName sorted) <$> replicateM (length ms) C.newEmptyMVar
+  barriers <- zip (map getModuleName sorted) <$> replicateM (length ms) ((,) <$> C.newEmptyMVar <*> C.newEmptyMVar)
 
   -- We need to load all dependencies, including transitive dependencies, since type
   -- class instances are propagated by import statements.
@@ -172,16 +172,17 @@ make MakeActions{..} ms = do
     let deps = fromMaybe (error "make: module not found in dependency graph.") $ lookup (getModuleName m) tClosure
     buildModule barriers (importPrim m) deps
 
-  -- TODO: wait for all threads to finish
-  C.threadDelay 1000000
+  for_ barriers (takeMVar . snd . snd)
 
   where
   -- Sort a list so its elements appear in the same order as in another list.
   inOrderOf :: (Ord a) => [a] -> [a] -> [a]
   inOrderOf xs ys = let s = S.fromList xs in filter (`S.member` s) ys
 
-  buildModule :: [(ModuleName, C.MVar ExternsFile)] -> Module -> [ModuleName] -> m ()
+  buildModule :: [(ModuleName, (C.MVar ExternsFile, C.MVar ()))] -> Module -> [ModuleName] -> m ()
   buildModule barriers m@(Module _ _ moduleName _ _) deps = do
+    externs <- mapM (readMVar . fst . fromMaybe (error "make: no barrier") . flip lookup barriers) deps
+
     outputTimestamp <- getOutputTimestamp moduleName
     dependencyTimestamp <- maximumMaybe <$> mapM (fmap shouldExist . getOutputTimestamp) deps
     inputTimestamp <- getInputTimestamp moduleName
@@ -195,7 +196,6 @@ make MakeActions{..} ms = do
     exts <- if shouldRebuild
               then do
                 progress $ CompilingModule moduleName
-                externs <- mapM (readMVar . fromMaybe (error "make: no barrier") . flip lookup barriers) deps
                 let env = foldl' (flip applyExternsFileToEnvironment) initEnvironment externs
                 lint m
                 ([desugared], nextVar) <- runSupplyT 0 $ desugar externs [m]
@@ -212,7 +212,8 @@ make MakeActions{..} ms = do
                 mexts <- decodeExterns . snd <$> readExterns moduleName
                 return $ fromMaybe (error "make: externs files are out of date. Try 'rm output/*/externs.json'.") mexts
 
-    putMVar (fromMaybe (error "make: no barrier") $ lookup moduleName barriers) exts
+    putMVar (fst $ fromMaybe (error "make: no barrier") $ lookup moduleName barriers) exts
+    putMVar (snd $ fromMaybe (error "make: no barrier") $ lookup moduleName barriers) ()
 
   maximumMaybe :: (Ord a) => [a] -> Maybe a
   maximumMaybe [] = Nothing
